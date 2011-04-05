@@ -1,0 +1,213 @@
+diff -rupN gateway-1.4.3/config.log gateway-1.4.3-patch/config.log
+--- gateway-1.4.3/config.log	2010-12-16 16:10:39.556817202 +0300
++++ gateway-1.4.3-patch/config.log	2010-12-17 08:03:03.511830592 +0300
+@@ -1210,6 +1210,7 @@ on davey-crockett
+ config.status:824: creating gwlib/gw_uuid_types.h
+ config.status:824: creating Makefile
+ config.status:824: creating gw-config.h
++config.status:1040: gw-config.h is unchanged
+ 
+ ## ---------------- ##
+ ## Cache variables. ##
+diff -rupN gateway-1.4.3/config.status gateway-1.4.3-patch/config.status
+--- gateway-1.4.3/config.status	2010-12-16 16:10:39.372822229 +0300
++++ gateway-1.4.3-patch/config.status	2010-12-17 08:03:03.363830069 +0300
+@@ -358,7 +358,7 @@ Copyright (C) 2008 Free Software Foundat
+ This config.status script is free software; the Free Software Foundation
+ gives unlimited permission to copy, distribute and modify it."
+ 
+-ac_pwd='/home/david/Projects/Kannel/gateway-1.4.3'
++ac_pwd='/home/david/Projects/Kannel/gateway-1.4.3-patch'
+ srcdir='.'
+ INSTALL='/usr/bin/install -c'
+ test -n "$AWK" || AWK=awk
+diff -rupN gateway-1.4.3/gw/smsbox.c gateway-1.4.3-patch/gw/smsbox.c
+--- gateway-1.4.3/gw/smsbox.c	2009-01-12 19:46:57.000000000 +0300
++++ gateway-1.4.3-patch/gw/smsbox.c	2010-12-17 08:25:09.135326892 +0300
+@@ -106,6 +106,7 @@ static Octstr *sendsms_interface = NULL;
+ static Octstr *smsbox_id = NULL;
+ static Octstr *sendsms_url = NULL;
+ static Octstr *sendota_url = NULL;
++static Octstr *refreshlist_url = NULL;
+ static Octstr *xmlrpc_url = NULL;
+ static Octstr *bb_host;
+ static Octstr *accepted_chars = NULL;
+@@ -2465,6 +2466,38 @@ static URLTranslation *authorise_user(Li
+ #endif
+ }
+ 
++static Octstr *smsbox_refresh_service(List *args, Octstr *client_ip, int *status,
++                                      HTTPClient *client)
++{
++    URLTranslation *t;
++    Octstr *name;
++
++    /* check the username and password */
++    t = authorise_user(args, client_ip);
++    if (t == NULL) {
++	*status = HTTP_FORBIDDEN;
++	return octstr_create("Authorization failed for sendsms");
++    }
++    
++    name = http_cgi_variable(args, "name");
++    if (name == NULL) {
++	error(0, "%s got insufficient headers (<name> is NULL)",
++	      octstr_get_cstr(sendsms_url));
++	*status = HTTP_BAD_REQUEST;
++	return octstr_create("Missing service name, rejected");
++    }
++
++    if (urltrans_refresh_service_lists(translations, name) == -1) {
++        error(0, "An error occurred while trying to refresh list for %s",
++              octstr_get_cstr(name));
++	*status = HTTP_INTERNAL_SERVER_ERROR;
++        return octstr_create("Refreshing service list failed");
++    }
++    else {
++        *status = HTTP_OK;
++        return octstr_create("Lists for service successfully refreshed");
++    }
++}
+ 
+ /*
+  * Create and send an SMS message from an HTTP request.
+@@ -3202,6 +3235,20 @@ static void sendsms_thread(void *arg)
+ 	else
+ 	    answer = smsbox_sendsms_post(hdrs, body, ip, &status, client);
+     }
++    /* refresh service-level white and black lists */
++    else if (octstr_compare(url, refreshlist_url) == 0)
++    {
++	/* 
++	 * decide if this is a GET or POST request,
++         * currently only GET requests are supported
++	 */
++	if (body == NULL)
++	    answer = smsbox_refresh_service(args, ip, &status, client);
++	else {
++	    answer = octstr_create("Only GET request for refresh list are supported.");
++            status = HTTP_BAD_REQUEST;
++        }
++    }
+     /* XML-RPC */
+     else if (octstr_compare(url, xmlrpc_url) == 0)
+     {
+@@ -3447,6 +3494,8 @@ static Cfg *init_smsbox(Cfg *cfg)
+         xmlrpc_url = octstr_imm("/cgi-bin/xmlrpc");
+     if ((sendota_url = cfg_get(grp, octstr_imm("sendota-url"))) == NULL)
+         sendota_url = octstr_imm("/cgi-bin/sendota");
++    if ((refreshlist_url = cfg_get(grp, octstr_imm("refresh-list-url"))) == NULL)
++        refreshlist_url = octstr_imm("/cgi-bin/refreshlist");
+ 
+     global_sender = cfg_get(grp, octstr_imm("global-sender"));
+     accepted_chars = cfg_get(grp, octstr_imm("sendsms-chars"));
+@@ -3638,6 +3687,7 @@ int main(int argc, char **argv)
+     octstr_destroy(smsbox_id);
+     octstr_destroy(sendsms_url);
+     octstr_destroy(sendota_url);
++    octstr_destroy(refreshlist_url);
+     octstr_destroy(xmlrpc_url);
+     octstr_destroy(reply_emptymessage);
+     octstr_destroy(reply_requestfailed);
+diff -rupN gateway-1.4.3/gw/urltrans.c gateway-1.4.3-patch/gw/urltrans.c
+--- gateway-1.4.3/gw/urltrans.c	2009-01-12 19:46:56.000000000 +0300
++++ gateway-1.4.3-patch/gw/urltrans.c	2011-04-05 10:39:50.132928593 +0300
+@@ -73,7 +73,7 @@
+ #include "gw/sms.h"
+ 
+ 
+-/***********************************************************************
++/***************************************nu********************************
+  * Definitions of data structures. These are not visible to the external
+  * world -- they may be accessed only via the functions declared in
+  * urltrans.h.
+@@ -114,6 +114,9 @@ struct URLTranslation {
+     Octstr *denied_prefix;	/* ...denied prefixes */
+     Octstr *allowed_recv_prefix; /* Prefixes (of receiver) allowed in this translation, or... */
+     Octstr *denied_recv_prefix;	/* ...denied prefixes */
++    Octstr *white_list_url; /* url to retreive the white list from */
++                            /* stored so that it can be refreshed on-demand */
++    Octstr *black_list_url; /* url to retreive the black list from */
+     Numhash *white_list;	/* To numbers allowed, or ... */
+     Numhash *black_list; /* ...denied numbers */
+ 
+@@ -247,6 +250,27 @@ int urltrans_add_cfg(URLTranslationList 
+     return 0;
+ }
+ 
++int urltrans_refresh_service_lists(URLTranslationList *trans, Octstr *name) {
++    List *list;
++    URLTranslation *ot;
++    int retval = -1;
++    long pos = 0;
++    list = dict_get(trans->names, name);
++    while (list && pos < gwlist_len(list) && (ot = gwlist_get(list, pos++)) != NULL) {
++      if (ot->type != TRANSTYPE_SENDSMS) {
++        if (ot->white_list_url != NULL) {
++            ot->white_list = numhash_create(octstr_get_cstr(ot->white_list_url));
++            retval = 0;
++        }
++        if (ot->black_list_url != NULL) {
++            ot->black_list = numhash_create(octstr_get_cstr(ot->black_list_url));
++            retval = 0;
++        }
++      }
++    }
++    return retval;
++}
++
+ 
+ URLTranslation *urltrans_find(URLTranslationList *trans, Msg *msg) 
+ {
+@@ -1102,6 +1126,7 @@ static URLTranslation *create_onetrans(C
+     
+     os = cfg_get(grp, octstr_imm("white-list"));
+     if (os != NULL) {
++        ot->white_list_url = octstr_duplicate(os);
+         ot->white_list = numhash_create(octstr_get_cstr(os));
+         octstr_destroy(os);
+     }
+@@ -1114,6 +1139,7 @@ static URLTranslation *create_onetrans(C
+ 
+     os = cfg_get(grp, octstr_imm("black-list"));
+     if (os != NULL) {
++        ot->black_list_url = octstr_duplicate(os);
+         ot->black_list = numhash_create(octstr_get_cstr(os));
+         octstr_destroy(os);
+     }
+@@ -1187,6 +1213,8 @@ static void destroy_onetrans(void *p) 
+ 	octstr_destroy(ot->denied_prefix);
+ 	octstr_destroy(ot->allowed_recv_prefix);
+ 	octstr_destroy(ot->denied_recv_prefix);
++	octstr_destroy(ot->white_list_url);
++	octstr_destroy(ot->black_list_url);
+ 	numhash_destroy(ot->white_list);
+ 	numhash_destroy(ot->black_list);
+         if (ot->keyword_regex != NULL) gw_regex_destroy(ot->keyword_regex);
+diff -rupN gateway-1.4.3/gw/urltrans.h gateway-1.4.3-patch/gw/urltrans.h
+--- gateway-1.4.3/gw/urltrans.h	2009-01-12 19:46:56.000000000 +0300
++++ gateway-1.4.3-patch/gw/urltrans.h	2010-12-16 16:47:15.796820039 +0300
+@@ -172,6 +172,12 @@ int urltrans_add_cfg(URLTranslationList 
+  */
+ URLTranslation *urltrans_find(URLTranslationList *trans, Msg *msg);
+ 
++/* Refresh the white list and black lists for a particular sms service,
++ * if specified in the config file by urls.
++ * returns 0 if everything goes according to plan, -1 otherwise
++ */
++int urltrans_refresh_service_lists(URLTranslationList *trans, Octstr *name);
++
+ /*
+  * Find the translation that corresponds to a given name
+  *
+diff -rupN gateway-1.4.3/gwlib/cfg.def gateway-1.4.3-patch/gwlib/cfg.def
+--- gateway-1.4.3/gwlib/cfg.def	2009-01-12 19:46:55.000000000 +0300
++++ gateway-1.4.3-patch/gwlib/cfg.def	2010-12-17 07:24:31.951828194 +0300
+@@ -256,6 +256,7 @@ SINGLE_GROUP(smsbox,
+     OCTSTR(sendsms-interface)    
+     OCTSTR(sendsms-url)
+     OCTSTR(sendota-url)
++    OCTSTR(refresh-list-url)
+     OCTSTR(xmlrpc-url)
+     OCTSTR(sendsms-chars)
+     OCTSTR(global-sender)
